@@ -1,0 +1,11 @@
+.env
+.env.*
+*.b64
+storage_state.json
+classroom_monitor_state.json
+scratch/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

@@ -1,0 +1,46 @@
+name: Classroom 24/7 Monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  check-classroom:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          playwright install chromium
+
+      - name: Restore monitor state
+        uses: actions/cache@v4
+        with:
+          path: classroom_monitor_state.json
+          key: classroom-state-${{ github.run_id }}
+          restore-keys: |
+            classroom-state-
+
+      - name: Decode Classroom session state
+        env:
+          CLASSROOM_STORAGE_STATE_B64: ${{ secrets.CLASSROOM_STORAGE_STATE_B64 }}
+        run: |
+          python -c "import base64, os; open('storage_state.json', 'wb').write(base64.b64decode(os.environ['CLASSROOM_STORAGE_STATE_B64']))"
+
+      - name: Run Classroom Telegram monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python scripts/classroom_tg_monitor.py --storage-state storage_state.json --state-file classroom_monitor_state.json
