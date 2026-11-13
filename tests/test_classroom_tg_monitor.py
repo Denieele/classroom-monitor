@@ -10,8 +10,11 @@ import pytest
 
 from scripts.classroom_tg_monitor import (
     AssignmentItem,
+    GradedItem,
     find_new_assignments,
+    find_new_grades,
     format_alert_message,
+    format_grade_message,
     is_urgent_assessment,
     resolve_telegram_config,
     run_monitor,
@@ -67,14 +70,21 @@ def test_run_monitor_sends_only_new_alerts(tmp_path: Path) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text("TELEGRAM_BOT_TOKEN=123456:ABC\nTELEGRAM_CHAT_ID=987654321\n", encoding="utf-8")
     state_file = tmp_path / "state.json"
-    state_file.write_text(json.dumps({"seen_ids": {"c1:a1": {}}, "auth_alert_sent": False}), encoding="utf-8")
+    state_file.write_text(
+        json.dumps({"seen_ids": {"c1:a1": {}}, "seen_grades": {"c1:g1": "10/10"}, "auth_alert_sent": False}),
+        encoding="utf-8",
+    )
 
     mocked_items = [
         AssignmentItem("c1:a1", "ПЗ 1", "Бізнес", "", "https://u/1", False),
         AssignmentItem("c1:a2", "Тест 3", "Фін", "18:00", "https://u/2", True),
     ]
+    mocked_grades = [
+        GradedItem("c1:g1", "ЛБ 4", "Big Data", "10/10", "https://u/g1"),
+        GradedItem("c1:g2", "ПР 1", "Хмарні", "100/100", "https://u/g2"),
+    ]
     with (
-        patch("scripts.classroom_tg_monitor.fetch_classroom_todo", return_value=mocked_items),
+        patch("scripts.classroom_tg_monitor.fetch_classroom_snapshot", return_value=(mocked_items, mocked_grades)),
         patch("scripts.classroom_tg_monitor.send_telegram_message") as mock_send,
     ):
         sent = run_monitor(
@@ -87,7 +97,21 @@ def test_run_monitor_sends_only_new_alerts(tmp_path: Path) -> None:
             only_urgent=False,
         )
 
-    assert sent == 1
-    mock_send.assert_called_once()
+    assert sent == 2
+    assert mock_send.call_count == 2
     saved = json.loads(state_file.read_text(encoding="utf-8"))
     assert "c1:a2" in saved["seen_ids"]
+    assert saved["seen_grades"]["c1:g2"] == "100/100"
+
+
+def test_find_new_grades_and_format() -> None:
+    items = [
+        GradedItem("c1:g1", "ЛБ 4", "Big Data", "10/10", "https://u/g1"),
+        GradedItem("c1:g2", "ЛБ 5", "Big Data", "9/10", "https://u/g2"),
+    ]
+    new_grades = find_new_grades(items, {"c1:g1": "10/10"})
+    assert len(new_grades) == 1
+    assert new_grades[0].task_id == "c1:g2"
+    msg = format_grade_message(new_grades[0])
+    assert "🎓 Оцінено роботу" in msg
+    assert "9/10" in msg

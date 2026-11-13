@@ -21,11 +21,16 @@ from playwright.sync_api import Page, sync_playwright
 LOGGER = logging.getLogger("classroom_tg_monitor")
 
 CLASSROOM_TODO_URL = "https://classroom.google.com/u/0/a/not-turned-in/all"
+CLASSROOM_TURNED_IN_URL = "https://classroom.google.com/u/0/a/turned-in/all"
 DEFAULT_SESSION_DIR = Path(r"C:\Users\Public\classroom_session")
 DEFAULT_STATE_FILE = Path("classroom_monitor_state.json")
 
 URGENT_PATTERN = re.compile(
     r"(тест|к/?р\b|мкр\b|мк\s*\d|контрольн|залік|екзамен|іспит|quiz|exam|forms\.gle|docs\.google\.com/forms)",
+    re.IGNORECASE,
+)
+GRADE_PATTERN = re.compile(
+    r"(\d+(?:[.,]\d+)?\s*/\s*\d+|оцінено|повернуто|graded|returned)",
     re.IGNORECASE,
 )
 
@@ -40,6 +45,17 @@ class AssignmentItem:
     due: str
     url: str
     is_urgent: bool
+
+
+@dataclass(frozen=True)
+class GradedItem:
+    """Normalized representation of a graded/returned Classroom assignment."""
+
+    task_id: str
+    title: str
+    course: str
+    grade: str
+    url: str
 
 
 def is_urgent_assessment(text: str) -> bool:
@@ -132,11 +148,12 @@ def send_telegram_message(
 def load_state(state_file: Path) -> dict[str, Any]:
     """Load persisted monitor state from disk."""
     if not state_file.exists():
-        return {"seen_ids": {}, "auth_alert_sent": False, "last_check": None}
+        return {"seen_ids": {}, "seen_grades": {}, "auth_alert_sent": False, "last_check": None}
     data = json.loads(state_file.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
-        return {"seen_ids": {}, "auth_alert_sent": False, "last_check": None}
+        return {"seen_ids": {}, "seen_grades": {}, "auth_alert_sent": False, "last_check": None}
     data.setdefault("seen_ids", {})
+    data.setdefault("seen_grades", {})
     data.setdefault("auth_alert_sent", False)
     return data
 
@@ -157,6 +174,14 @@ def find_new_assignments(
     return [item for item in current if item.task_id not in seen_ids]
 
 
+def find_new_grades(
+    current: list[GradedItem],
+    seen_grades: dict[str, str],
+) -> list[GradedItem]:
+    """Return graded items whose grade/status is new or changed."""
+    return [item for item in current if seen_grades.get(item.task_id) != item.grade]
+
+
 def format_alert_message(item: AssignmentItem) -> str:
     """Format a concise Ukrainian Telegram alert for a new assignment."""
     header = "🚨 НОВИЙ ТЕСТ / КР у Classroom!" if item.is_urgent else "📌 Нове завдання у Classroom"
@@ -171,9 +196,21 @@ def format_alert_message(item: AssignmentItem) -> str:
     )
 
 
-def _extract_assignments_from_page(page: Page) -> list[AssignmentItem]:
-    """Extract assignment cards from Google Classroom To-Do page."""
-    raw_items: list[dict[str, str]] = page.evaluate(
+def format_grade_message(item: GradedItem) -> str:
+    """Format a concise Ukrainian Telegram alert for a newly graded assignment."""
+    course_str = item.course or "Курс 4-го курсу"
+    return (
+        "🎓 Оцінено роботу у Classroom!\n"
+        f"Предмет: {course_str}\n"
+        f"Завдання: {item.title}\n"
+        f"Оцінка / Статус: {item.grade}\n"
+        f"Посилання: {item.url}"
+    )
+
+
+def _extract_raw_cards(page: Page) -> list[dict[str, Any]]:
+    """Extract raw assignment card links and text lines from a Classroom To-Do/Turned-in page."""
+    return page.evaluate(
         """() => {
             const results = [];
             const seen = new Set();
@@ -189,26 +226,34 @@ def _extract_assignments_from_page(page: Page) -> list[AssignmentItem]:
                     .filter(Boolean);
                 const title = (a.innerText || '').trim().split('\\n')[0] || lines[0] || 'Без назви';
                 const course = lines.length > 1 ? lines[1] : '';
-                const due = lines.find(l => /термін|здати|сьогодні|завтра|nov|dec|січ|лис|гру|\\d{1,2}:\\d{2}/i.test(l)) || '';
-                results.push({ href, title, course, due });
+                results.push({ href, title, course, lines });
             }
             return results;
         }"""
     )
 
+
+def _extract_assignments_from_page(page: Page) -> list[AssignmentItem]:
+    """Extract assignment cards from Google Classroom To-Do page."""
+    raw_items = _extract_raw_cards(page)
     items: list[AssignmentItem] = []
     for row in raw_items:
-        url = row["href"]
+        url = str(row["href"])
         match = re.search(r"/c/([^/]+)/a/([^/]+)", url)
         task_id = f"{match.group(1)}:{match.group(2)}" if match else url
-        title = row["title"]
-        course = row["course"]
+        title = str(row["title"])
+        course = str(row["course"])
+        lines: list[str] = [str(x) for x in row.get("lines", [])]
+        due = next(
+            (ln for ln in lines if re.search(r"термін|здати|сьогодні|завтра|nov|dec|січ|лис|гру|\d{1,2}:\d{2}", ln, re.IGNORECASE)),
+            "",
+        )
         items.append(
             AssignmentItem(
                 task_id=task_id,
                 title=title,
                 course=course,
-                due=row["due"],
+                due=due,
                 url=url,
                 is_urgent=is_urgent_assessment(f"{title} {course}"),
             )
@@ -216,12 +261,48 @@ def _extract_assignments_from_page(page: Page) -> list[AssignmentItem]:
     return items
 
 
-def fetch_classroom_todo(
+def _extract_graded_from_page(page: Page) -> list[GradedItem]:
+    """Extract graded/returned items from Google Classroom Turned-in page."""
+    raw_items = _extract_raw_cards(page)
+    graded: list[GradedItem] = []
+    for row in raw_items:
+        url = str(row["href"])
+        match = re.search(r"/c/([^/]+)/a/([^/]+)", url)
+        task_id = f"{match.group(1)}:{match.group(2)}" if match else url
+        title = str(row["title"])
+        course = str(row["course"])
+        lines: list[str] = [str(x) for x in row.get("lines", [])]
+        grade_lines = [ln for ln in lines if GRADE_PATTERN.search(ln)]
+        if not grade_lines:
+            continue
+        graded.append(
+            GradedItem(
+                task_id=task_id,
+                title=title,
+                course=course,
+                grade=" | ".join(dict.fromkeys(grade_lines)),
+                url=url,
+            )
+        )
+    return graded
+
+
+def _expand_sections(page: Page, limit: int = 8) -> None:
+    """Expand collapsed Classroom sections."""
+    for toggle in page.locator('[aria-expanded="false"]').all()[:limit]:
+        try:
+            toggle.click(timeout=1500)
+            page.wait_for_timeout(300)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("Skipping non-clickable toggle: %s", exc)
+
+
+def fetch_classroom_snapshot(
     session_dir: Path | None,
     storage_state_path: Path | None,
     timeout_ms: int = 30000,
-) -> list[AssignmentItem]:
-    """Open Google Classroom To-Do page using either storage_state JSON or persistent profile."""
+) -> tuple[list[AssignmentItem], list[GradedItem]]:
+    """Fetch both To-Do assignments and Turned-in graded items in one browser session."""
     with sync_playwright() as p:
         if storage_state_path is not None and storage_state_path.exists():
             browser = p.chromium.launch(headless=True)
@@ -240,20 +321,19 @@ def fetch_classroom_todo(
             page = ctx.new_page()
             page.goto(CLASSROOM_TODO_URL, wait_until="domcontentloaded", timeout=timeout_ms)
             page.wait_for_timeout(4000)
-
-            current_url = page.url.lower()
-            if "accounts.google.com" in current_url:
+            if "accounts.google.com" in page.url.lower():
                 raise PermissionError("Google Classroom session expired (redirected to login)")
+            _expand_sections(page)
+            todo_items = _extract_assignments_from_page(page)
 
-            # Expand collapsible sections ("Без терміну", "Цього тижня", etc.) if collapsed
-            for toggle in page.locator('[aria-expanded="false"]').all()[:6]:
-                try:
-                    toggle.click(timeout=1500)
-                    page.wait_for_timeout(300)
-                except Exception as exc:  # noqa: BLE001
-                    LOGGER.debug("Skipping non-clickable toggle: %s", exc)
+            page.goto(CLASSROOM_TURNED_IN_URL, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(4000)
+            if "accounts.google.com" in page.url.lower():
+                raise PermissionError("Google Classroom session expired (redirected to login)")
+            _expand_sections(page)
+            graded_items = _extract_graded_from_page(page)
 
-            return _extract_assignments_from_page(page)
+            return todo_items, graded_items
         finally:
             ctx.close()
             if browser is not None:
@@ -293,9 +373,13 @@ def run_monitor(
     token, chat_id = resolve_telegram_config(env_file)
     state = load_state(state_file)
     seen_ids: dict[str, Any] = state["seen_ids"]
+    seen_grades: dict[str, str] = state["seen_grades"]
 
     try:
-        current = fetch_classroom_todo(session_dir=session_dir, storage_state_path=storage_state_path)
+        current, current_graded = fetch_classroom_snapshot(
+            session_dir=session_dir,
+            storage_state_path=storage_state_path,
+        )
     except PermissionError as exc:
         LOGGER.error("Auth error: %s", exc)
         if not state.get("auth_alert_sent") and not dry_run:
@@ -312,7 +396,14 @@ def run_monitor(
     state["last_check"] = datetime.now(UTC).isoformat()
 
     new_items = find_new_assignments(current, seen_ids)
-    LOGGER.info("Scanned %d active items, %d new", len(current), len(new_items))
+    new_grades = find_new_grades(current_graded, seen_grades)
+    LOGGER.info(
+        "Scanned %d active (%d new), %d graded (%d new/updated)",
+        len(current),
+        len(new_items),
+        len(current_graded),
+        len(new_grades),
+    )
 
     alerts_sent = 0
     for item in new_items:
@@ -325,6 +416,17 @@ def run_monitor(
         msg = format_alert_message(item)
         if dry_run:
             LOGGER.info("[DRY-RUN] Would send alert for %s (%s)", item.title, item.task_id)
+        else:
+            send_telegram_message(token, chat_id, msg)
+            alerts_sent += 1
+
+    for graded in new_grades:
+        seen_grades[graded.task_id] = graded.grade
+        if init_baseline or only_urgent:
+            continue
+        msg = format_grade_message(graded)
+        if dry_run:
+            LOGGER.info("[DRY-RUN] Would send grade alert for %s (%s)", graded.title, graded.grade)
         else:
             send_telegram_message(token, chat_id, msg)
             alerts_sent += 1
