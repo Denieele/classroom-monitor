@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import html
 import json
 import logging
 import os
@@ -30,7 +31,10 @@ URGENT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 GRADE_PATTERN = re.compile(
-    r"(\d+(?:[.,]\d+)?\s*/\s*\d+|оцінено|повернуто|graded|returned)",
+    r"(\d+(?:[.,]\d+)?\s*/\s*\d+"
+    r"|\d+(?:[.,]\d+)?\s+бал\w*\s+(?:із|з)\s+можливих\s+\d+"
+    r"|\d+(?:[.,]\d+)?\s+out\s+of\s+\d+"
+    r"|оцінено|повернуто|graded|returned)",
     re.IGNORECASE,
 )
 
@@ -112,6 +116,7 @@ def send_telegram_message(
         {
             "chat_id": chat_id,
             "text": text,
+            "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
     ).encode("utf-8")
@@ -183,33 +188,38 @@ def find_new_grades(
 
 
 def format_alert_message(item: AssignmentItem) -> str:
-    """Format a concise Ukrainian Telegram alert for a new assignment."""
-    header = "🚨 НОВИЙ ТЕСТ / КР у Classroom!" if item.is_urgent else "📌 Нове завдання у Classroom"
-    due_str = item.due or "Без терміну"
-    course_str = item.course or "Курс 4-го курсу"
+    """Format a concise Ukrainian Telegram HTML alert for a new assignment."""
+    header = "🚨 <b>НОВИЙ ТЕСТ / КР у Classroom!</b>" if item.is_urgent else "📌 <b>Нове завдання у Classroom</b>"
+    due_str = html.escape(item.due or "Без терміну")
+    course_str = html.escape(item.course or "Курс 4-го курсу")
+    title_str = html.escape(item.title)
+    url_str = html.escape(item.url, quote=True)
     return (
-        f"{header}\n"
-        f"Предмет: {course_str}\n"
-        f"Завдання: {item.title}\n"
-        f"Термін: {due_str}\n"
-        f"Посилання: {item.url}"
+        f"{header}\n\n"
+        f"📚 <b>Предмет:</b> {course_str}\n"
+        f"📝 <b>Завдання:</b> {title_str}\n"
+        f"⏰ <b>Термін:</b> {due_str}\n\n"
+        f"🔗 <a href=\"{url_str}\">Відкрити в Classroom</a>"
     )
 
 
 def format_grade_message(item: GradedItem) -> str:
-    """Format a concise Ukrainian Telegram alert for a newly graded assignment."""
-    course_str = item.course or "Курс 4-го курсу"
+    """Format a concise Ukrainian Telegram HTML alert for a newly graded assignment."""
+    course_str = html.escape(item.course or "Курс 4-го курсу")
+    title_str = html.escape(item.title)
+    grade_str = html.escape(item.grade)
+    url_str = html.escape(item.url, quote=True)
     return (
-        "🎓 Оцінено роботу у Classroom!\n"
-        f"Предмет: {course_str}\n"
-        f"Завдання: {item.title}\n"
-        f"Оцінка / Статус: {item.grade}\n"
-        f"Посилання: {item.url}"
+        "🎓 <b>Оцінено роботу у Classroom</b>\n\n"
+        f"📚 <b>Предмет:</b> {course_str}\n"
+        f"📝 <b>Завдання:</b> {title_str}\n"
+        f"⭐ <b>Оцінка:</b> <code>{grade_str}</code>\n\n"
+        f"🔗 <a href=\"{url_str}\">Відкрити в Classroom</a>"
     )
 
 
 def _extract_raw_cards(page: Page) -> list[dict[str, Any]]:
-    """Extract raw assignment card links and text lines from a Classroom To-Do/Turned-in page."""
+    """Extract clean visible text lines from Classroom To-Do / Turned-in cards."""
     return page.evaluate(
         """() => {
             const results = [];
@@ -220,11 +230,23 @@ def _extract_raw_cards(page: Page) -> list[dict[str, Any]]:
                 if (!href || seen.has(href)) continue;
                 seen.add(href);
                 const container = a.closest('li, [role="listitem"], div[data-item-id]') || a.parentElement;
-                const lines = (container ? container.innerText : a.innerText || '')
-                    .split('\\n')
-                    .map(s => s.trim())
-                    .filter(Boolean);
-                const title = (a.innerText || '').trim().split('\\n')[0] || lines[0] || 'Без назви';
+                const lines = [];
+                if (container) {
+                    const leaves = Array.from(container.querySelectorAll('*')).filter(el => {
+                        if (el.children.length > 0) return false;
+                        if (el.tagName === 'I' || el.closest('[aria-hidden="true"], svg')) return false;
+                        return Boolean((el.innerText || '').trim());
+                    });
+                    for (const el of leaves) {
+                        for (const part of el.innerText.split('\\n')) {
+                            const txt = part.trim();
+                            if (txt && !lines.includes(txt)) {
+                                lines.push(txt);
+                            }
+                        }
+                    }
+                }
+                const title = lines[0] || 'Без назви';
                 const course = lines.length > 1 ? lines[1] : '';
                 results.push({ href, title, course, lines });
             }
@@ -261,6 +283,22 @@ def _extract_assignments_from_page(page: Page) -> list[AssignmentItem]:
     return items
 
 
+def _normalize_grade_text(grade_lines: list[str]) -> str:
+    """Normalize verbose Classroom grade strings like '60 балів із можливих 100' into '60/100'."""
+    for ln in grade_lines:
+        slash_match = re.search(r"\d+(?:[.,]\d+)?\s*/\s*\d+", ln)
+        if slash_match:
+            return re.sub(r"\s+", "", slash_match.group(0))
+        words_match = re.search(
+            r"(\d+(?:[.,]\d+)?)\s+(?:бал\w*\s+(?:із|з)\s+можливих|out\s+of)\s+(\d+)",
+            ln,
+            re.IGNORECASE,
+        )
+        if words_match:
+            return f"{words_match.group(1)}/{words_match.group(2)}"
+    return grade_lines[0]
+
+
 def _extract_graded_from_page(page: Page) -> list[GradedItem]:
     """Extract graded/returned items from Google Classroom Turned-in page."""
     raw_items = _extract_raw_cards(page)
@@ -275,12 +313,13 @@ def _extract_graded_from_page(page: Page) -> list[GradedItem]:
         grade_lines = [ln for ln in lines if GRADE_PATTERN.search(ln)]
         if not grade_lines:
             continue
+        grade_text = _normalize_grade_text(grade_lines)
         graded.append(
             GradedItem(
                 task_id=task_id,
                 title=title,
                 course=course,
-                grade=" | ".join(dict.fromkeys(grade_lines)),
+                grade=grade_text,
                 url=url,
             )
         )

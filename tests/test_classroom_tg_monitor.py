@@ -11,6 +11,7 @@ import pytest
 from scripts.classroom_tg_monitor import (
     AssignmentItem,
     GradedItem,
+    _normalize_grade_text,
     find_new_assignments,
     find_new_grades,
     format_alert_message,
@@ -50,9 +51,10 @@ def test_find_new_assignments_filters_seen() -> None:
 def test_format_alert_message_marks_urgent() -> None:
     item = AssignmentItem("c1:a2", "МКР 2", "ЕМПІ", "14.11 08:00", "https://example.com", True)
     msg = format_alert_message(item)
-    assert "🚨 НОВИЙ ТЕСТ / КР" in msg
+    assert "НОВИЙ ТЕСТ / КР" in msg
     assert "ЕМПІ" in msg
     assert "МКР 2" in msg
+    assert '<a href="https://example.com">Відкрити в Classroom</a>' in msg
 
 
 def test_resolve_telegram_config_reads_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -113,5 +115,13 @@ def test_find_new_grades_and_format() -> None:
     assert len(new_grades) == 1
     assert new_grades[0].task_id == "c1:g2"
     msg = format_grade_message(new_grades[0])
-    assert "🎓 Оцінено роботу" in msg
-    assert "9/10" in msg
+    assert "Оцінено роботу" in msg
+    assert "<code>9/10</code>" in msg
+    assert '<a href="https://u/g2">Відкрити в Classroom</a>' in msg
+
+
+def test_normalize_grade_text() -> None:
+    assert _normalize_grade_text(["60 балів із можливих 100"]) == "60/100"
+    assert _normalize_grade_text(["95 out of 100"]) == "95/100"
+    assert _normalize_grade_text(["18 / 20"]) == "18/20"
+    assert _normalize_grade_text(["Оцінено"]) == "Оцінено"
